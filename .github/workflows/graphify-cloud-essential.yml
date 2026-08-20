@@ -1,0 +1,592 @@
+name: Eliza Cloud essential Graphify evidence (ephemeral)
+
+on:
+  pull_request:
+    branches:
+      - graphify/base-a3a97677-20260820
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graphify-cloud-a3a97677
+  cancel-in-progress: false
+
+jobs:
+  graphify:
+    name: Frozen-source cloud control and execution graph
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: a3a97677713d256485900ca9531bb015c5c51f43
+      SOURCE_TREE: 63cc0b474d753fb64093ae1dfd0ab31ec37a5bbb
+      GRAPHIFY_VERSION: 0.9.46
+      GRAPHIFY_WHEEL_SHA256: 35d854d66884c623a8e25ca059b54744ade91ae17ffc0f79fd39e108a1666b5d
+      GRAPHIFY_QUERY_LOG_DISABLE: '1'
+      GRAPHIFY_MAX_WORKERS: '1'
+      PYTHONHASHSEED: '0'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      NO_COLOR: '1'
+      TZ: UTC
+
+    steps:
+      - name: Check out frozen source with essential sparse paths
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.env.example
+            /AGENTS.md
+            /CLAUDE.md
+            /README.md
+            /package.json
+            /bun.lock
+            /bun.lockb
+            /tsconfig.json
+            /tsconfig.test.json
+            /next.config.ts
+            /middleware.ts
+            /instrumentation.ts
+            /instrumentation-client.ts
+            /drizzle.config.ts
+            /vercel.json
+            /docker-compose.yml
+            /Dockerfile
+            /Dockerfile.*
+            /app/api/
+            /app/actions/
+            /packages/config/
+            /packages/db/
+            /packages/infra/
+            /packages/lib/
+            /packages/services/
+            /packages/types/
+            /bootstrapper/
+
+      - name: Prove source freeze and initialize evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          mkdir -p "$evidence/logs" "$evidence/queries"
+          actual_sha="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse HEAD^{tree})"
+          test "$actual_sha" = "$SOURCE_SHA"
+          test "$actual_tree" = "$SOURCE_TREE"
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "source_sha=$actual_sha"
+            echo "source_tree=$actual_tree"
+            echo "source_commit_date=$(git show -s --format=%cI HEAD)"
+            echo "workflow_event_sha=$GITHUB_SHA"
+            echo "workflow_ref=$GITHUB_REF"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+          } | tee "$evidence/logs/source-freeze.log"
+          git status --short --branch | tee "$evidence/logs/initial-git-status.log"
+          git sparse-checkout list | tee "$evidence/logs/sparse-checkout-patterns.log"
+          git submodule status --recursive > "$evidence/logs/submodules.log" 2>&1 || true
+          git lfs ls-files > "$evidence/logs/git-lfs-files.log" 2>&1 || true
+
+      - name: Build complete path census and partition register
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          export EVIDENCE_DIR="$evidence"
+          python3 - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from collections import Counter, defaultdict
+          from pathlib import Path
+
+          root = Path(os.environ['EVIDENCE_DIR'])
+          source_sha = os.environ['SOURCE_SHA']
+          raw = subprocess.check_output(['git', 'ls-tree', '-r', '-z', source_sha])
+
+          def partition(path: str) -> str:
+              if path.startswith('app/api/'):
+                  return 'essential_app_api'
+              if path.startswith('app/actions/'):
+                  return 'essential_server_actions'
+              if path.startswith('packages/lib/'):
+                  return 'essential_business_logic'
+              if path.startswith('packages/db/'):
+                  return 'essential_database'
+              if path.startswith('packages/infra/'):
+                  return 'essential_infrastructure'
+              if path.startswith('packages/services/'):
+                  return 'essential_services'
+              if path.startswith('packages/config/'):
+                  return 'essential_configuration'
+              if path.startswith('packages/types/'):
+                  return 'essential_types'
+              if path.startswith('bootstrapper/'):
+                  return 'essential_container_bootstrapper'
+              if path.startswith('packages/agent-skills/'):
+                  return 'deferred_agent_skills'
+              if path.startswith('packages/tests/') or path.startswith('tests/') or '/__tests__/' in path:
+                  return 'deferred_tests'
+              if path.startswith('packages/ui/') or path.startswith('components/') or (path.startswith('app/') and not path.startswith(('app/api/', 'app/actions/'))):
+                  return 'deferred_application_ui'
+              if path.startswith('packages/content/') or path.startswith('public/'):
+                  return 'deferred_content_media'
+              if path.startswith('packages/scripts/') or path.startswith('scripts/'):
+                  return 'deferred_scripts_operations'
+              if path.startswith('docs/') or path.startswith('.github/') or path.endswith(('.md', '.mdx')):
+                  return 'deferred_docs_automation'
+              if '/' not in path:
+                  return 'root_runtime_configuration'
+              return 'deferred_miscellaneous'
+
+          rows = []
+          counts = Counter()
+          materialized_counts = Counter()
+          materialized_bytes = defaultdict(int)
+          extension_counts = Counter()
+          for record in raw.split(b'\0'):
+              if not record:
+                  continue
+              meta, path_bytes = record.split(b'\t', 1)
+              mode, obj_type, obj_sha = meta.decode('utf-8').split(' ', 2)
+              path = path_bytes.decode('utf-8')
+              part = partition(path)
+              p = Path(path)
+              materialized = p.is_file()
+              size = p.stat().st_size if materialized else ''
+              digest = ''
+              if materialized:
+                  h = hashlib.sha256()
+                  with p.open('rb') as stream:
+                      for block in iter(lambda: stream.read(1024 * 1024), b''):
+                          h.update(block)
+                  digest = h.hexdigest()
+                  materialized_counts[part] += 1
+                  materialized_bytes[part] += int(size)
+                  extension_counts[p.suffix.lower() or '[none]'] += 1
+              counts[part] += 1
+              rows.append({
+                  'path': path,
+                  'git_mode': mode,
+                  'git_type': obj_type,
+                  'git_object_sha': obj_sha,
+                  'partition': part,
+                  'materialized': 'yes' if materialized else 'no',
+                  'materialized_bytes': size,
+                  'sha256': digest,
+              })
+
+          with (root / 'SOURCE_COVERAGE.csv').open('w', encoding='utf-8', newline='') as stream:
+              writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(rows)
+
+          partition_rows = []
+          essential = {
+              'essential_app_api', 'essential_server_actions', 'essential_business_logic',
+              'essential_database', 'essential_infrastructure', 'essential_services',
+              'essential_configuration', 'essential_types', 'essential_container_bootstrapper',
+              'root_runtime_configuration'
+          }
+          for name in sorted(counts):
+              partition_rows.append({
+                  'partition': name,
+                  'tracked_paths': counts[name],
+                  'materialized_paths': materialized_counts[name],
+                  'materialized_bytes': materialized_bytes[name],
+                  'deep_graph_status': 'selected' if name in essential else 'deferred_registry_only',
+              })
+          with (root / 'PARTITION_REGISTER.csv').open('w', encoding='utf-8', newline='') as stream:
+              writer = csv.DictWriter(stream, fieldnames=list(partition_rows[0].keys()))
+              writer.writeheader()
+              writer.writerows(partition_rows)
+
+          summary = {
+              'tracked_path_count': len(rows),
+              'materialized_path_count': sum(materialized_counts.values()),
+              'materialized_bytes': sum(materialized_bytes.values()),
+              'partition_counts': dict(sorted(counts.items())),
+              'materialized_partition_counts': dict(sorted(materialized_counts.items())),
+              'materialized_partition_bytes': dict(sorted(materialized_bytes.items())),
+              'materialized_extensions': dict(sorted(extension_counts.items())),
+          }
+          (root / 'SOURCE_CENSUS.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Install checksum-verified Graphify
+        id: graphify_install
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          venv="$RUNNER_TEMP/graphify-venv"
+          status=0
+          python3 --version | tee "$evidence/logs/python-version.log" || status=$?
+          python3 -m venv "$venv" || status=$?
+          if [ "$status" -eq 0 ]; then
+            source "$venv/bin/activate"
+            python -m pip install --upgrade pip > "$evidence/logs/pip-upgrade.log" 2>&1 || status=$?
+            mkdir -p "$RUNNER_TEMP/graphify-wheel"
+            python -m pip download --no-deps --only-binary=:all: "graphifyy==$GRAPHIFY_VERSION" -d "$RUNNER_TEMP/graphify-wheel" > "$evidence/logs/wheel-download.log" 2>&1 || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            wheel="$(find "$RUNNER_TEMP/graphify-wheel" -maxdepth 1 -type f -name 'graphifyy-*.whl' -print -quit)"
+            test -n "$wheel" || status=1
+          fi
+          if [ "$status" -eq 0 ]; then
+            printf '%s  %s\n' "$GRAPHIFY_WHEEL_SHA256" "$wheel" | sha256sum -c - > "$evidence/logs/wheel-sha256.log" 2>&1 || status=$?
+            cp "$wheel" "$evidence/"
+            python -m pip install "$wheel" > "$evidence/logs/graphify-install.log" 2>&1 || status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            graphify --version | tee "$evidence/logs/graphify-version.log" || status=$?
+            python -m pip freeze | sort > "$evidence/logs/python-environment.freeze.txt"
+          fi
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/graphify-install-status.json"
+          exit "$status"
+
+      - name: Run native Graphify pass 1
+        id: graphify_pass_1
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          status=0
+          if [ ! -f "$RUNNER_TEMP/graphify-venv/bin/activate" ]; then
+            status=125
+          else
+            source "$RUNNER_TEMP/graphify-venv/bin/activate"
+            rm -rf graphify-out graph.json
+            graphify extract . --code-only --force --timing --max-workers 1 > "$evidence/logs/graphify-pass-1-extract.log" 2>&1 || status=$?
+            if [ "$status" -eq 0 ]; then
+              graphify cluster-only . --no-label --timing > "$evidence/logs/graphify-pass-1-cluster.log" 2>&1 || status=$?
+            fi
+            if [ "$status" -eq 0 ] && [ -s graphify-out/graph.json ] && [ -s graphify-out/GRAPH_REPORT.md ]; then
+              cp -a graphify-out "$evidence/run-1"
+            elif [ "$status" -eq 0 ]; then
+              status=126
+            fi
+          fi
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/graphify-pass-1-status.json"
+          exit "$status"
+
+      - name: Run independent native Graphify pass 2
+        id: graphify_pass_2
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          status=0
+          if [ ! -f "$RUNNER_TEMP/graphify-venv/bin/activate" ]; then
+            status=125
+          else
+            source "$RUNNER_TEMP/graphify-venv/bin/activate"
+            rm -rf graphify-out graph.json
+            graphify extract . --code-only --force --timing --max-workers 1 > "$evidence/logs/graphify-pass-2-extract.log" 2>&1 || status=$?
+            if [ "$status" -eq 0 ]; then
+              graphify cluster-only . --no-label --timing > "$evidence/logs/graphify-pass-2-cluster.log" 2>&1 || status=$?
+            fi
+            if [ "$status" -eq 0 ] && [ -s graphify-out/graph.json ] && [ -s graphify-out/GRAPH_REPORT.md ]; then
+              cp -a graphify-out "$evidence/run-2"
+            elif [ "$status" -eq 0 ]; then
+              status=126
+            fi
+          fi
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/graphify-pass-2-status.json"
+          exit "$status"
+
+      - name: Verify native graph integrity and determinism
+        id: graph_review
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          export EVIDENCE_DIR="$evidence"
+          status=0
+          python3 - <<'PY' > "$evidence/logs/native-review.log" 2>&1 || status=$?
+          import hashlib
+          import json
+          import os
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path(os.environ['EVIDENCE_DIR'])
+          volatile = {'generated_at','created_at','updated_at','timestamp','timing','duration','duration_ms','elapsed','cost','run_id','built_at'}
+          def scrub(value):
+              if isinstance(value, dict):
+                  return {k: scrub(v) for k, v in sorted(value.items()) if k not in volatile}
+              if isinstance(value, list):
+                  return [scrub(v) for v in value]
+              return value
+
+          summaries = []
+          canonical_payloads = []
+          for run_name in ('run-1', 'run-2'):
+              path = root / run_name / 'graph.json'
+              if not path.exists():
+                  summaries.append({'run': run_name, 'present': False})
+                  canonical_payloads.append(None)
+                  continue
+              data = json.loads(path.read_text(encoding='utf-8'))
+              nodes = data.get('nodes', [])
+              edges = data.get('links', data.get('edges', []))
+              if isinstance(nodes, dict): nodes = list(nodes.values())
+              if isinstance(edges, dict): edges = list(edges.values())
+              ids = [str(node.get('id')) for node in nodes]
+              endpoints = set(ids)
+              missing = []
+              self_loops = 0
+              signatures = []
+              for edge in edges:
+                  source = edge.get('source')
+                  target = edge.get('target')
+                  if isinstance(source, dict): source = source.get('id')
+                  if isinstance(target, dict): target = target.get('id')
+                  source = str(source); target = str(target)
+                  if source not in endpoints or target not in endpoints:
+                      missing.append([source, target])
+                  if source == target:
+                      self_loops += 1
+                  signatures.append((source, target, str(edge.get('relation', edge.get('type', 'unknown')))))
+              canonical = json.dumps({
+                  'nodes': sorted(json.dumps(scrub(n), sort_keys=True, separators=(',', ':'), ensure_ascii=False) for n in nodes),
+                  'edges': sorted(json.dumps(scrub(e), sort_keys=True, separators=(',', ':'), ensure_ascii=False) for e in edges),
+              }, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+              canonical_payloads.append(canonical)
+              summaries.append({
+                  'run': run_name,
+                  'present': True,
+                  'graph_json_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'canonical_structure_sha256': hashlib.sha256(canonical).hexdigest(),
+                  'node_count': len(nodes),
+                  'edge_count': len(edges),
+                  'community_count': len({n.get('community') for n in nodes if n.get('community') is not None}),
+                  'unique_node_ids': len(ids) == len(set(ids)),
+                  'missing_endpoints': missing,
+                  'self_loops': self_loops,
+                  'duplicate_edge_signatures': len(signatures) - len(set(signatures)),
+                  'node_types': dict(sorted(Counter(str(n.get('type', n.get('kind', 'unknown'))) for n in nodes).items())),
+                  'edge_relations': dict(sorted(Counter(str(e.get('relation', e.get('type', 'unknown'))) for e in edges).items())),
+              })
+          result = {
+              'runs': summaries,
+              'both_present': all(item.get('present') for item in summaries),
+              'exact_graph_json_match': len(summaries) == 2 and summaries[0].get('graph_json_sha256') == summaries[1].get('graph_json_sha256'),
+              'canonical_structure_match': canonical_payloads[0] is not None and canonical_payloads[0] == canonical_payloads[1],
+          }
+          (root / 'NATIVE_DETERMINISM.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+          if not result['both_present'] or not result['canonical_structure_match']:
+              raise SystemExit('native Graphify outputs missing or structurally non-deterministic')
+          if not all(s['unique_node_ids'] and not s['missing_endpoints'] and s['self_loops'] == 0 and s['duplicate_edge_signatures'] == 0 for s in summaries):
+              raise SystemExit('native graph integrity failure')
+          PY
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/native-review-status.json"
+          exit "$status"
+
+      - name: Execute Graphify query probes
+        id: graph_queries
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          source "$RUNNER_TEMP/graphify-venv/bin/activate" 2>/dev/null || exit 125
+          graph="$evidence/run-2/graph.json"
+          questions=(
+            'credit transaction deduction'
+            'Privy token organization authorization'
+            'AWS ECS container deployment'
+            'AgentRuntime cloud runtime'
+            'API key authentication rate limit'
+            'Stripe webhook idempotency'
+            'x402 payment verification'
+            'MCP proxy authorization'
+            'organization membership boundary'
+            'provider health monitor'
+          )
+          status=0
+          printf '[\n' > "$evidence/NATIVE_QUERY_RESULTS.json"
+          for i in "${!questions[@]}"; do
+            q="${questions[$i]}"
+            n=$((i+1))
+            printf -v file 'Q%02d.txt' "$n"
+            set +e
+            output="$(graphify query "$q" --graph "$graph" 2>&1)"
+            rc=$?
+            set -e
+            printf 'QUESTION\n%s\n\nRETURN CODE\n%s\n\nOUTPUT\n%s\n' "$q" "$rc" "$output" > "$evidence/queries/$file"
+            Q="$q" RC="$rc" OUT="$output" python3 - <<'PY' >> "$evidence/NATIVE_QUERY_RESULTS.json"
+          import json, os
+          print(json.dumps({'question': os.environ['Q'], 'returncode': int(os.environ['RC']), 'output': os.environ['OUT']}) + ',')
+          PY
+            if [ "$rc" -ne 0 ]; then status=1; fi
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("$RUNNER_TEMP/cloud-evidence/NATIVE_QUERY_RESULTS.json")
+          text=p.read_text()
+          text=text.rsplit(',',1)[0]+'\n]\n'
+          p.write_text(text)
+          PY
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/native-query-status.json"
+          exit "$status"
+
+      - name: Run static corpus qualification
+        id: static_qualification
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          export EVIDENCE_DIR="$evidence"
+          status=0
+          git diff --check "$SOURCE_SHA" > "$evidence/logs/git-diff-check.log" 2>&1 || status=$?
+          python3 - <<'PY' > "$evidence/logs/static-qualification.log" 2>&1 || status=$?
+          import json, os, re
+          from pathlib import Path
+          root = Path(os.environ['EVIDENCE_DIR'])
+          json_errors=[]; secret_findings=[]; scanned=0
+          secret_rules = [
+              ('private_key_header', re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')),
+              ('aws_access_key', re.compile(r'AKIA[0-9A-Z]{16}')),
+              ('github_token', re.compile(r'gh[pousr]_[A-Za-z0-9_]{20,}')),
+              ('openai_key', re.compile(r'sk-[A-Za-z0-9]{20,}')),
+          ]
+          for p in sorted(Path('.').rglob('*')):
+              if not p.is_file() or '.git' in p.parts:
+                  continue
+              scanned += 1
+              if p.suffix.lower() == '.json':
+                  try: json.loads(p.read_text(encoding='utf-8'))
+                  except Exception as exc: json_errors.append({'path':p.as_posix(),'error':str(exc)})
+              if p.suffix.lower() in {'.ts','.tsx','.js','.mjs','.cjs','.json','.yml','.yaml','.toml','.env','.example','.md'} or p.name == '.env.example':
+                  try: text=p.read_text(encoding='utf-8', errors='ignore')
+                  except Exception: continue
+                  for rule, pattern in secret_rules:
+                      if pattern.search(text):
+                          secret_findings.append({'path':p.as_posix(),'rule':rule})
+          result={'files_scanned':scanned,'json_errors':json_errors,'credential_pattern_findings':secret_findings}
+          (root/'STATIC_QUALIFICATION.json').write_text(json.dumps(result,indent=2)+'\n')
+          if json_errors or secret_findings:
+              raise SystemExit('static qualification found parse errors or credential-like literals')
+          print(json.dumps(result,indent=2))
+          PY
+          printf '{"exit_code":%s}\n' "$status" > "$evidence/static-qualification-status.json"
+          exit "$status"
+
+      - name: Record project qualification boundary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          cat > "$evidence/PROJECT_QUALIFICATION.json" <<'JSON'
+          {
+            "dependency_install": "NOT_RUN_SPARSE_GRAPHIFICATION_WORKSPACE",
+            "typecheck": "NOT_RUN_SPARSE_GRAPHIFICATION_WORKSPACE",
+            "unit_tests": "NOT_RUN_SPARSE_GRAPHIFICATION_WORKSPACE",
+            "integration_tests": "NOT_RUN_SPARSE_GRAPHIFICATION_WORKSPACE",
+            "build": "NOT_RUN_SPARSE_GRAPHIFICATION_WORKSPACE",
+            "reason": "The workflow deliberately materializes only the essential cloud control and execution planes. A complete workspace is required for Bun workspace installation, Next.js build, database-backed tests and service integration tests."
+          }
+          JSON
+
+      - name: Finalize evidence manifest and hashes
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          mkdir -p "$evidence/logs"
+          export EVIDENCE_DIR="$evidence"
+          export EVENT_SHA="$GITHUB_SHA"
+          export EVENT_REF="$GITHUB_REF"
+          export REPOSITORY="$GITHUB_REPOSITORY"
+          export RUN_ID="$GITHUB_RUN_ID"
+          export RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT"
+          export INSTALL_OUTCOME="${{ steps.graphify_install.outcome }}"
+          export PASS1_OUTCOME="${{ steps.graphify_pass_1.outcome }}"
+          export PASS2_OUTCOME="${{ steps.graphify_pass_2.outcome }}"
+          export REVIEW_OUTCOME="${{ steps.graph_review.outcome }}"
+          export QUERY_OUTCOME="${{ steps.graph_queries.outcome }}"
+          export STATIC_OUTCOME="${{ steps.static_qualification.outcome }}"
+          python3 - <<'PY'
+          import hashlib, json, os, platform
+          from pathlib import Path
+          root=Path(os.environ['EVIDENCE_DIR'])
+          def digest(path):
+              h=hashlib.sha256()
+              with path.open('rb') as stream:
+                  for block in iter(lambda:stream.read(1024*1024),b''): h.update(block)
+              return h.hexdigest()
+          files=[]
+          for path in sorted(p for p in root.rglob('*') if p.is_file()):
+              if path.name in {'ARTIFACT_HASHES.sha256','NATIVE_RUN_MANIFEST.json'}: continue
+              files.append({'path':path.relative_to(root).as_posix(),'bytes':path.stat().st_size,'sha256':digest(path)})
+          manifest={
+              'schema_version':'1.0',
+              'repository':os.environ['REPOSITORY'],
+              'frozen_source_sha':os.environ['SOURCE_SHA'],
+              'frozen_source_tree':os.environ['SOURCE_TREE'],
+              'workflow_event_sha':os.environ['EVENT_SHA'],
+              'workflow_ref':os.environ['EVENT_REF'],
+              'workflow_run_id':os.environ['RUN_ID'],
+              'workflow_run_attempt':os.environ['RUN_ATTEMPT'],
+              'graphify_package':'graphifyy',
+              'graphify_version':os.environ['GRAPHIFY_VERSION'],
+              'graphify_wheel_sha256':os.environ['GRAPHIFY_WHEEL_SHA256'],
+              'execution_mode':'native Graphify CLI; sparse essential cloud control/execution corpus; two code-only passes; no LLM labels',
+              'query_logging_disabled':os.environ.get('GRAPHIFY_QUERY_LOG_DISABLE')=='1',
+              'python':platform.python_version(),
+              'platform':platform.platform(),
+              'step_outcomes':{
+                  'graphify_install':os.environ['INSTALL_OUTCOME'],
+                  'graphify_pass_1':os.environ['PASS1_OUTCOME'],
+                  'graphify_pass_2':os.environ['PASS2_OUTCOME'],
+                  'graph_review':os.environ['REVIEW_OUTCOME'],
+                  'graph_queries':os.environ['QUERY_OUTCOME'],
+                  'static_qualification':os.environ['STATIC_OUTCOME'],
+              },
+              'files':files,
+          }
+          mp=root/'NATIVE_RUN_MANIFEST.json'; mp.write_text(json.dumps(manifest,indent=2)+'\n')
+          with (root/'ARTIFACT_HASHES.sha256').open('w') as stream:
+              for item in files: stream.write(f"{item['sha256']}  {item['path']}\n")
+              stream.write(f"{digest(mp)}  NATIVE_RUN_MANIFEST.json\n")
+          PY
+          find "$evidence" -maxdepth 4 -type f -printf '%P\t%s bytes\n' | sort | tee "$evidence/logs/artifact-list.log"
+
+      - name: Upload evidence artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cloud-essential-graphify-a3a97677
+          path: ${{ runner.temp }}/cloud-evidence/**
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+          compression-level: 6
+          overwrite: false
+
+      - name: Enforce native evidence gate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/cloud-evidence"
+          test "$(python3 -c 'import json; print(json.load(open("'$evidence'/graphify-install-status.json"))["exit_code"])')" = 0
+          test "$(python3 -c 'import json; print(json.load(open("'$evidence'/graphify-pass-1-status.json"))["exit_code"])')" = 0
+          test "$(python3 -c 'import json; print(json.load(open("'$evidence'/graphify-pass-2-status.json"))["exit_code"])')" = 0
+          test "$(python3 -c 'import json; print(json.load(open("'$evidence'/native-review-status.json"))["exit_code"])')" = 0
